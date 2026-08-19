@@ -21,8 +21,14 @@ The component is emitted at
 
 ## The script
 
-The **first file input** declared in the manifest step is the Rhai entry
-script. Any remaining files are read by the host and handed to the script via
+The entry script comes from one of two places:
+
+- If the manifest step declares a **`script` field**, its value is the Rhai
+  entry script, and every file input stays available via the `files` map.
+- Otherwise the **first file input** is the entry script. It is *consumed*: it
+  does not appear in the `files` map, which holds only the remaining files.
+
+Either way the remaining files are read by the host and handed to the script via
 the `files` map. Directories declared in `dirs` are preopened read-only and
 reachable with the filesystem functions below.
 
@@ -42,7 +48,7 @@ fails the step with the thrown message.
 | `identity`      | `Principal`             | The signing identity as a `Principal`.                  |
 | `proxy`         | `Principal` \| `()`     | Proxy canister if `--proxy` was set, else unit.         |
 | `dirs`          | `Array` of `String`     | Declared directories (preopened read-only).             |
-| `files`         | `Map` (name → `String`) | Declared files, including the entry script, by name.    |
+| `files`         | `Map` (name → `String`) | Declared files by name (minus a consumed entry script). |
 | `fields`        | `Map` (name → `String`) | Key-value fields declared in the step's `fields`.       |
 | `canister_ids`  | `Map` (name → `String`) | Every project canister's name → textual principal.      |
 

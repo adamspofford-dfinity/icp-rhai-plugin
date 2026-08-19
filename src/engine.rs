@@ -11,23 +11,35 @@ use sha2::{Digest, Sha256};
 
 use crate::icp::sync_plugin::types::{CallTarget, CallType};
 use crate::principal::{self, RhaiPrincipal};
-use crate::{CanisterCallRequest, SyncExecInput, canister_call};
+use crate::{CanisterCallRequest, FileInput, SyncExecInput, canister_call};
 
-/// Run the entry script found in `input.files` with all capabilities wired in.
-/// Returns the plugin's `exec` result: `Ok(())` on a clean run, or a
-/// human-readable error string on any failure.
+/// Run the entry script with all capabilities wired in. Returns the plugin's
+/// `exec` result: `Ok(())` on a clean run, or a human-readable error string on
+/// any failure.
+///
+/// The script source is the `script` field when the manifest declares one;
+/// otherwise it is the first declared file input, which is then *consumed* — it
+/// no longer appears in the `files` map the script sees. The remaining files are
+/// exposed either way.
 pub fn run(input: SyncExecInput) -> Result<(), String> {
-    // By contract the first declared file input is the Rhai entry script; the
-    // remaining files stay available to the script via the `files` constant.
-    let script = input
-        .files
-        .first()
-        .ok_or("no script provided: the first file input must be the Rhai script")?;
-    let script_name = script.name.clone();
-    let script_src = script.content.clone();
+    let script_field = input.fields.iter().find(|f| f.name == "script");
+
+    let (script_name, script_src, files): (String, String, &[FileInput]) = match script_field {
+        Some(f) => ("<script field>".to_string(), f.value.clone(), &input.files),
+        None => {
+            let script = input.files.first().ok_or(
+                "no script provided: declare a `script` field or make the first file input the Rhai script",
+            )?;
+            (
+                script.name.clone(),
+                script.content.clone(),
+                &input.files[1..],
+            )
+        }
+    };
 
     let engine = build_engine();
-    let mut scope = build_scope(&input)?;
+    let mut scope = build_scope(&input, files)?;
 
     engine
         .run_with_scope(&mut scope, &script_src)
@@ -179,8 +191,10 @@ fn register_encoding(engine: &mut Engine) {
     );
 }
 
-/// Build the scope holding the sync inputs as script-visible constants.
-fn build_scope(input: &SyncExecInput) -> Result<Scope<'static>, String> {
+/// Build the scope holding the sync inputs as script-visible constants. `files`
+/// is the set of files exposed as the `files` map — the caller passes the inputs
+/// minus any first file consumed as the entry script.
+fn build_scope(input: &SyncExecInput, files: &[FileInput]) -> Result<Scope<'static>, String> {
     let canister = Principal::from_text(&input.canister_id).map_err(|e| {
         format!(
             "host passed an invalid canister id '{}': {e}",
@@ -194,8 +208,7 @@ fn build_scope(input: &SyncExecInput) -> Result<Scope<'static>, String> {
         )
     })?;
 
-    let files: Map = input
-        .files
+    let files: Map = files
         .iter()
         .map(|f| (f.name.clone().into(), Dynamic::from(f.content.clone())))
         .collect();
