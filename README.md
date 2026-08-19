@@ -1,0 +1,132 @@
+# icp-rhai-plugin
+
+An [icp-cli](https://github.com/dfinity/icp-cli) **sync plugin** that runs a
+[Rhai](https://rhai.rs) script against the canister being synced. It implements
+the `icp:sync-plugin` WIT world (see [`sync-plugin.wit`](sync-plugin.wit)) and
+exposes to the script roughly the same capabilities a native sync plugin has —
+calling the target canister, the sync inputs, and read-only filesystem access —
+plus Candid, principal, and encoding helpers convenient for canister work.
+
+## Building
+
+The plugin is a WebAssembly component targeting `wasm32-wasip2`:
+
+```sh
+rustup target add wasm32-wasip2
+cargo build --target wasm32-wasip2 --release
+```
+
+The component is emitted at
+`target/wasm32-wasip2/release/icp_rhai_plugin.wasm`.
+
+## The script
+
+The **first file input** declared in the manifest step is the Rhai entry
+script. Any remaining files are read by the host and handed to the script via
+the `files` map. Directories declared in `dirs` are preopened read-only and
+reachable with the filesystem functions below.
+
+A script runs to completion for a clean sync; throwing (or a runtime error)
+fails the step with the thrown message.
+
+## Scripting API
+
+### Sync inputs (constants)
+
+| Name            | Type                    | Description                                             |
+| --------------- | ----------------------- | ------------------------------------------------------- |
+| `canister_id`   | `String`                | Textual principal of the target canister.               |
+| `canister`      | `Principal`             | The target canister as a `Principal`.                   |
+| `environment`   | `String`                | Environment being synced (e.g. `"production"`).         |
+| `identity_id`   | `String`                | Textual principal of the signing identity.              |
+| `identity`      | `Principal`             | The signing identity as a `Principal`.                  |
+| `proxy`         | `Principal` \| `()`     | Proxy canister if `--proxy` was set, else unit.         |
+| `dirs`          | `Array` of `String`     | Declared directories (preopened read-only).             |
+| `files`         | `Map` (name → `String`) | Declared files, including the entry script, by name.    |
+
+### Canister calls
+
+The host always calls the canister named by `canister_id`; the plugin cannot
+choose a different target. Each call returns the raw Candid-encoded response
+bytes as a `Blob`, or throws with the host's error message.
+
+```js
+// Shorthands: empty-arg style is just candid_encode("()").
+let resp = call_query("get_count", candid_encode("()"));
+let resp = call_update("set_count", candid_encode("(7 : nat64)"));
+
+// General form. Only `method` is required.
+let resp = canister_call(#{
+    method: "transfer",
+    arg: candid_encode("(record { to = principal \"aaaaa-aa\"; amount = 10 : nat })"),
+    query: false,   // default false → update; true → query
+    direct: false,  // default false → route update through the proxy if configured
+    cycles: 0,      // attached to a proxied update call only
+});
+```
+
+### Candid
+
+```js
+let bytes = candid_encode("(42 : nat64, \"hi\")"); // text value → Blob
+let text  = candid_decode(bytes);                  // Blob → text (best-effort)
+```
+
+Number literals default to `int`/`nat`; annotate them (`42 : nat64`) when the
+method signature needs a specific width. `candid_decode` reconstructs a
+structural view without type information, so record fields appear as their
+numeric hashes — it is meant for inspection, not round-tripping.
+
+### Principals
+
+```js
+let p = principal("ryjl3-tyaaa-aaaaa-aaaba-cai"); // text → Principal (throws if invalid)
+let q = principal_from_blob(p.to_blob());          // bytes → Principal
+p.to_text();                                       // → String
+p.to_blob();                                       // → Blob (raw bytes)
+p == q;                                            // equality
+```
+
+### Encoding helpers
+
+```js
+to_hex(blob);        // Blob → hex String
+from_hex("deadbeef"); // hex String → Blob
+sha256(blob);         // Blob → 32-byte Blob
+
+json_decode(`{"a":1}`); // JSON String → Dynamic (map/array/scalar)
+json_encode(value);      // Dynamic → JSON String
+```
+
+### Filesystem
+
+Read-only access to the preopened `dirs` is provided by
+[`rhai-fs`](https://crates.io/crates/rhai-fs) (`open_file`, `read_string`,
+`read_blob`, seeking, etc.):
+
+```js
+let f = open_file("assets/data.json", "r");
+let text = f.read_string();
+```
+
+Writes fail because the host preopens directories read-only.
+
+### Output
+
+`print(..)` writes to stdout, shown as transient progress and discarded when
+the step ends. `debug(..)` and `eprint(..)` write to stderr, which is also
+printed persistently after the step completes — use them for warnings and
+summaries the user should still see.
+
+## Example
+
+```js
+// Bump a counter and report the new value.
+let before = candid_decode(call_query("get", candid_encode("()")));
+eprint("count before sync: " + before);
+
+call_update("increment", candid_encode("()"));
+
+let after = candid_decode(call_query("get", candid_encode("()")));
+eprint("count after sync: " + after);
+```
