@@ -9,7 +9,7 @@ use rhai::{Blob, Dynamic, Engine, EvalAltResult, Map, Scope};
 use rhai_fs::FilesystemPackage;
 use sha2::{Digest, Sha256};
 
-use crate::icp::sync_plugin::types::CallType;
+use crate::icp::sync_plugin::types::{CallTarget, CallType};
 use crate::principal::{self, RhaiPrincipal};
 use crate::{CanisterCallRequest, SyncExecInput, canister_call};
 
@@ -65,9 +65,12 @@ fn build_engine() -> Engine {
 
 /// Register `canister_call` and its `call_update` / `call_query` shorthands.
 fn register_canister_calls(engine: &mut Engine) {
-    // The general form: `canister_call(#{ method, arg, query, direct, cycles })`.
-    // Only `method` is required; the rest default to an empty-arg update call
-    // routed through the proxy (if configured) with no cycles.
+    // The general form:
+    // `canister_call(#{ method, arg, query, direct, cycles, target })`.
+    // Only `method` is required; the rest default to an empty-arg update call to
+    // the canister being synced, routed through the proxy (if configured) with
+    // no cycles. `target` selects a declared-dependency canister (see
+    // `map_target`); omitted, it targets the canister being synced.
     engine.register_fn(
         "canister_call",
         |opts: Map| -> Result<Blob, Box<EvalAltResult>> {
@@ -94,16 +97,31 @@ fn register_canister_calls(engine: &mut Engine) {
             };
             let direct = map_bool(&opts, "direct")?;
             let cycles = map_cycles(&opts)?;
+            let target = map_target(&opts)?;
 
-            host_call(method, arg, call_type, direct, cycles)
+            host_call(target, method, arg, call_type, direct, cycles)
         },
     );
 
     engine.register_fn("call_update", |method: &str, arg: Blob| {
-        host_call(method.to_string(), arg, CallType::Update, false, 0)
+        host_call(
+            CallTarget::Host,
+            method.to_string(),
+            arg,
+            CallType::Update,
+            false,
+            0,
+        )
     });
     engine.register_fn("call_query", |method: &str, arg: Blob| {
-        host_call(method.to_string(), arg, CallType::Query, false, 0)
+        host_call(
+            CallTarget::Host,
+            method.to_string(),
+            arg,
+            CallType::Query,
+            false,
+            0,
+        )
     });
 }
 
@@ -186,6 +204,18 @@ fn build_scope(input: &SyncExecInput) -> Result<Scope<'static>, String> {
         .iter()
         .map(|d| Dynamic::from(d.clone()))
         .collect();
+    let fields: Map = input
+        .fields
+        .iter()
+        .map(|f| (f.name.clone().into(), Dynamic::from(f.value.clone())))
+        .collect();
+    // Name → textual principal, as passed by the host. A script can wrap a value
+    // in `principal(..)`, or hand it straight to a `canister_call` `target`.
+    let canister_ids: Map = input
+        .canister_ids
+        .iter()
+        .map(|e| (e.name.clone().into(), Dynamic::from(e.id.clone())))
+        .collect();
 
     let proxy: Dynamic = match &input.proxy_canister_id {
         Some(text) => {
@@ -205,13 +235,16 @@ fn build_scope(input: &SyncExecInput) -> Result<Scope<'static>, String> {
         .push_constant("identity", RhaiPrincipal(identity))
         .push_constant("proxy", proxy)
         .push_constant("dirs", dirs)
-        .push_constant("files", files);
+        .push_constant("files", files)
+        .push_constant("fields", fields)
+        .push_constant("canister_ids", canister_ids);
     Ok(scope)
 }
 
 /// Invoke the host `canister-call` import, mapping its error string into a Rhai
 /// runtime error so scripts can `try`/`catch` or let it abort the run.
 fn host_call(
+    target: CallTarget,
     method: String,
     arg: Vec<u8>,
     call_type: CallType,
@@ -219,6 +252,7 @@ fn host_call(
     cycles: u64,
 ) -> Result<Blob, Box<EvalAltResult>> {
     let req = CanisterCallRequest {
+        target,
         method,
         arg,
         call_type,
@@ -253,4 +287,32 @@ fn map_cycles(opts: &Map) -> Result<u64, Box<EvalAltResult>> {
         }
         None => Ok(0),
     }
+}
+
+/// Resolve the optional `target` field into a [`CallTarget`].
+///
+/// Missing (or unit) targets the canister being synced. A `Principal` targets
+/// that canister by its textual principal. A string is resolved the same way
+/// the manifest's `canisters:` list is: if it parses as a principal it targets
+/// by id, otherwise it is treated as a canister name. The target must have been
+/// declared as a dependency in the sync step's `canisters` list, or the host
+/// rejects the call.
+fn map_target(opts: &Map) -> Result<CallTarget, Box<EvalAltResult>> {
+    let Some(v) = opts.get("target") else {
+        return Ok(CallTarget::Host);
+    };
+    if v.is_unit() {
+        return Ok(CallTarget::Host);
+    }
+    if let Some(p) = v.clone().try_cast::<RhaiPrincipal>() {
+        return Ok(CallTarget::Id(p.0.to_text()));
+    }
+    let text = v
+        .clone()
+        .into_string()
+        .map_err(|t| format!("canister_call: `target` must be a string or Principal, got {t}"))?;
+    Ok(match Principal::from_text(&text) {
+        Ok(p) => CallTarget::Id(p.to_text()),
+        Err(_) => CallTarget::Name(text),
+    })
 }

@@ -43,15 +43,27 @@ fails the step with the thrown message.
 | `proxy`         | `Principal` \| `()`     | Proxy canister if `--proxy` was set, else unit.         |
 | `dirs`          | `Array` of `String`     | Declared directories (preopened read-only).             |
 | `files`         | `Map` (name → `String`) | Declared files, including the entry script, by name.    |
+| `fields`        | `Map` (name → `String`) | Key-value fields declared in the step's `fields`.       |
+| `canister_ids`  | `Map` (name → `String`) | Every project canister's name → textual principal.      |
+
+`canister_ids` is informational: it maps each named canister in the project
+(both `subproject:local` keys and bare local names for same-subproject siblings)
+to its textual principal for the environment being synced. Being listed does not
+grant permission to call a canister — that still requires declaring it in the
+step's `canisters:` list. Wrap a value in `principal(..)` for a `Principal`, or
+pass it straight to a call's `target`.
 
 ### Canister calls
 
-The host always calls the canister named by `canister_id`; the plugin cannot
-choose a different target. Each call returns the raw Candid-encoded response
-bytes as a `Blob`, or throws with the host's error message.
+By default a call targets the canister being synced (`canister_id`). A call may
+instead target any canister declared as a dependency in the sync step's
+`canisters:` list, via the `target` field (see below). Each call returns the raw
+Candid-encoded response bytes as a `Blob`, or throws with the host's error
+message.
 
 ```js
 // Shorthands: empty-arg style is just candid_encode("()").
+// These always target the canister being synced.
 let resp = call_query("get_count", candid_encode("()"));
 let resp = call_update("set_count", candid_encode("(7 : nat64)"));
 
@@ -62,6 +74,10 @@ let resp = canister_call(#{
     query: false,   // default false → update; true → query
     direct: false,  // default false → route update through the proxy if configured
     cycles: 0,      // attached to a proxied update call only
+    // target: omitted → the canister being synced. A string that parses as a
+    // principal (or a Principal value) targets by id; any other string targets
+    // by canister name. The target must be declared in `canisters:`.
+    target: "ledger",
 });
 ```
 

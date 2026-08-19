@@ -1,4 +1,4 @@
-package icp:sync-plugin@0.1.0;
+package icp:sync-plugin@0.2.0;
 
 /// Types shared between the host runtime and sync plugins.
 interface types {
@@ -14,6 +14,53 @@ interface types {
         content: string,
     }
 
+    /// A key-value field declared in the manifest step's `fields` setting.
+    /// The host passes the plugin's declared fields inline; how they are
+    /// interpreted is up to the plugin.
+    record field-input {
+        /// Field name, as spelled in the manifest.
+        name: string,
+        /// Field value.
+        value: string,
+    }
+
+    /// An entry in the project's canister ID mapping table: a canister name
+    /// and the textual principal it resolves to in the environment being synced.
+    record canister-id-entry {
+        /// The canister's fully-qualified project key: the subproject it belongs
+        /// to (a path relative to the app root) joined to its local name by a
+        /// single colon, e.g. "services/open-accounts:backend". A canister
+        /// defined directly in the project being synced has no subproject prefix
+        /// and appears as its bare local name, e.g. "backend".
+        ///
+        /// Every canister in the same subproject as the canister being synced is
+        /// additionally listed under its bare local name (a duplicate entry with
+        /// the same `id`), so a plugin can address a sibling by the same local
+        /// name the manifest uses.
+        name: string,
+        /// Textual principal the name resolves to for this environment.
+        id: string,
+    }
+
+    /// Which canister a `canister-call-request` targets.
+    ///
+    /// A plugin may target the canister being synced, or any canister it
+    /// declared as a dependency in the sync step's `canisters` list — by that
+    /// canister's name or by its textual principal. Targeting a canister that
+    /// was not declared as a dependency is rejected by the host.
+    variant call-target {
+        /// The canister being synced (`sync-exec-input.canister-id`). Always
+        /// permitted, whether or not it also appears in `canisters`.
+        host,
+        /// A declared-dependency canister identified by name, spelled exactly as
+        /// it appears in `sync-exec-input.canister-ids` — a bare local name for a
+        /// canister in the same subproject, or a `subproject:local` key
+        /// otherwise. The host resolves it against that mapping table.
+        name(string),
+        /// A declared-dependency canister identified by its textual principal.
+        id(string),
+    }
+
     /// Input passed by the runtime to the plugin's exec() export.
     record sync-exec-input {
         /// Textual principal of the canister being synced.
@@ -27,15 +74,28 @@ interface types {
         /// Files declared in the manifest step's `files` setting, read by
         /// the host and passed inline. The plugin decides how to use them.
         files: list<file-input>,
+        /// Key-value fields declared in the manifest step's `fields` setting,
+        /// passed inline. The plugin decides how to use them.
+        fields: list<field-input>,
         /// Textual principal of the signing identity used for canister calls.
         identity-principal: string,
         /// Textual principal of the proxy canister, if one was configured via
         /// `--proxy`. None when no proxy is in use.
         proxy-canister-id: option<string>,
+        /// Name→principal mapping for every named canister in the project for
+        /// the environment being synced, sorted by name. Informational: the
+        /// plugin may use it to resolve canister names it knows about. Being
+        /// listed here does not grant permission to call a canister — that
+        /// still requires declaring it as a dependency (see `call-target`).
+        canister-ids: list<canister-id-entry>,
     }
 
-    /// A request to call a method on the target canister.
+    /// A request to call a method on a canister.
     record canister-call-request {
+        /// Which canister to call. `host` targets the canister being synced;
+        /// `name`/`id` target a canister declared as a dependency in the sync
+        /// step's `canisters` list.
+        target: call-target,
         /// The canister method to call.
         method: string,
         /// Candid-encoded argument bytes. The plugin is responsible for
@@ -59,15 +119,17 @@ interface types {
 
 /// The complete interface of a sync plugin.
 world sync-plugin {
-    use types.{sync-exec-input, canister-call-request, file-input};
+    use types.{sync-exec-input, canister-call-request, call-target, canister-id-entry, file-input, field-input};
 
     // -------------------------------------------------------------------------
     // Host functions (imports) — provided by icp-cli, called by the plugin
     // -------------------------------------------------------------------------
 
-    /// Make an update or query call to the canister being synced.
-    /// The host always calls the canister from sync-exec-input.canister-id;
-    /// the plugin does not choose the target.
+    /// Make an update or query call to a canister.
+    /// The `req.target` selects the canister: the one being synced (`host`), or
+    /// a canister declared as a dependency in the sync step's `canisters` list,
+    /// by name or principal. A target that was not declared as a dependency is
+    /// rejected without making a call.
     /// Returns the raw Candid-encoded response bytes on success or an error
     /// message on failure. The plugin is responsible for decoding.
     import canister-call: func(req: canister-call-request) -> result<list<u8>, string>;
