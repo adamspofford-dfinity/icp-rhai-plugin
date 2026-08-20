@@ -135,6 +135,16 @@ fn register_canister_calls(engine: &mut Engine) {
             0,
         )
     });
+    engine.register_fn("call_other", |name: &str, method: &str, arg: Blob| {
+        host_call(
+            CallTarget::Name(name.to_string()),
+            method.to_string(),
+            arg,
+            CallType::Update,
+            false,
+            0,
+        )
+    });
 }
 
 /// Register Candid textual encode/decode helpers.
