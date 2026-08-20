@@ -11,39 +11,57 @@ use sha2::{Digest, Sha256};
 
 use crate::icp::sync_plugin::types::{CallTarget, CallType};
 use crate::principal::{self, RhaiPrincipal};
-use crate::{CanisterCallRequest, FileInput, SyncExecInput, canister_call};
+use crate::{CanisterCallRequest, SyncExecInput, canister_call};
 
 /// Run the entry script with all capabilities wired in. Returns the plugin's
 /// `exec` result: `Ok(())` on a clean run, or a human-readable error string on
 /// any failure.
 ///
-/// The script source is the `script` field when the manifest declares one;
-/// otherwise it is the first declared file input, which is then *consumed* — it
-/// no longer appears in the `files` map the script sees. The remaining files are
-/// exposed either way.
+/// The script source comes from whichever of the two `script` declarations the
+/// manifest step uses: the `script` field holds the source inline, and the file
+/// declared under the `script` key holds it on disk. Declaring both is an error.
+/// Every declared file — the entry script included — stays visible to the script
+/// in the `files` map.
 pub fn run(input: SyncExecInput) -> Result<(), String> {
-    let script_field = input.fields.iter().find(|f| f.name == "script");
-
-    let (script_name, script_src, files): (String, String, &[FileInput]) = match script_field {
-        Some(f) => ("<script field>".to_string(), f.value.clone(), &input.files),
-        None => {
-            let script = input.files.first().ok_or(
-                "no script provided: declare a `script` field or make the first file input the Rhai script",
-            )?;
-            (
-                script.name.clone(),
-                script.content.clone(),
-                &input.files[1..],
-            )
-        }
-    };
+    let (script_name, script_src) = entry_script(&input)?;
 
     let engine = build_engine();
-    let mut scope = build_scope(&input, files)?;
+    let mut scope = build_scope(&input)?;
 
     engine
         .run_with_scope(&mut scope, &script_src)
         .map_err(|e| format!("{script_name}: {e}"))
+}
+
+/// Resolve the entry script to a `(name for error messages, source)` pair.
+fn entry_script(input: &SyncExecInput) -> Result<(String, String), String> {
+    let field = input.fields.iter().find(|f| f.name == "script");
+    let mut files = input
+        .files
+        .iter()
+        .filter(|f| f.key.as_deref() == Some("script"));
+    let file = files.next();
+
+    if let Some(extra) = files.next() {
+        return Err(format!(
+            "the `script` key maps to more than one file ('{}' and '{}'); it must name exactly one Rhai script",
+            file.expect("first file precedes the second").name,
+            extra.name,
+        ));
+    }
+
+    match (field, file) {
+        (Some(field), None) => Ok(("<script field>".to_string(), field.value.clone())),
+        (None, Some(file)) => Ok((file.name.clone(), file.content.clone())),
+        (Some(_), Some(file)) => Err(format!(
+            "the step declares both a `script` field and a `script` file ('{}'); use one or the other",
+            file.name,
+        )),
+        (None, None) => Err(
+            "no script provided: declare the Rhai source in a `script` field, or point the `script` file key at a Rhai script"
+                .to_string(),
+        ),
+    }
 }
 
 /// Construct the engine and register every host-provided capability.
@@ -201,10 +219,8 @@ fn register_encoding(engine: &mut Engine) {
     );
 }
 
-/// Build the scope holding the sync inputs as script-visible constants. `files`
-/// is the set of files exposed as the `files` map — the caller passes the inputs
-/// minus any first file consumed as the entry script.
-fn build_scope(input: &SyncExecInput, files: &[FileInput]) -> Result<Scope<'static>, String> {
+/// Build the scope holding the sync inputs as script-visible constants.
+fn build_scope(input: &SyncExecInput) -> Result<Scope<'static>, String> {
     let canister = Principal::from_text(&input.canister_id).map_err(|e| {
         format!(
             "host passed an invalid canister id '{}': {e}",
@@ -218,15 +234,21 @@ fn build_scope(input: &SyncExecInput, files: &[FileInput]) -> Result<Scope<'stat
         )
     })?;
 
-    let files: Map = files
+    let files: Map = input
+        .files
         .iter()
         .map(|f| (f.name.clone().into(), Dynamic::from(f.content.clone())))
         .collect();
     let dirs: rhai::Array = input
         .dirs
         .iter()
-        .map(|d| Dynamic::from(d.clone()))
+        .map(|d| Dynamic::from(d.path.clone()))
         .collect();
+    // The manifest keys `dirs:`/`files:` were declared under, if any, grouped for
+    // lookup: a key maps to every path declared beneath it, in declaration order.
+    // Plain-list entries carry no key and appear only in `dirs`/`files`.
+    let dir_keys = group_by_key(input.dirs.iter().map(|d| (d.key.as_deref(), &d.path)));
+    let file_keys = group_by_key(input.files.iter().map(|f| (f.key.as_deref(), &f.name)));
     let fields: Map = input
         .fields
         .iter()
@@ -258,10 +280,29 @@ fn build_scope(input: &SyncExecInput, files: &[FileInput]) -> Result<Scope<'stat
         .push_constant("identity", RhaiPrincipal(identity))
         .push_constant("proxy", proxy)
         .push_constant("dirs", dirs)
+        .push_constant("dir_keys", dir_keys)
         .push_constant("files", files)
+        .push_constant("file_keys", file_keys)
         .push_constant("fields", fields)
         .push_constant("canister_ids", canister_ids);
     Ok(scope)
+}
+
+/// Group declared paths by the manifest map key they were declared under,
+/// dropping the entries that have none. Each key maps to an `Array` of paths in
+/// declaration order, since one key may name several paths.
+fn group_by_key<'a>(entries: impl Iterator<Item = (Option<&'a str>, &'a String)>) -> Map {
+    let mut grouped = Map::new();
+    for (key, path) in entries {
+        let Some(key) = key else { continue };
+        grouped
+            .entry(key.into())
+            .or_insert_with(|| Dynamic::from(rhai::Array::new()))
+            .write_lock::<rhai::Array>()
+            .expect("entry was just inserted as an array")
+            .push(Dynamic::from(path.clone()));
+    }
+    grouped
 }
 
 /// Invoke the host `canister-call` import, mapping its error string into a Rhai

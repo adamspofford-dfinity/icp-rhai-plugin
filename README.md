@@ -21,16 +21,27 @@ The component is emitted at
 
 ## The script
 
-The entry script comes from one of two places:
+The entry script comes from one of two places, and declaring both is an error:
 
-- If the manifest step declares a **`script` field**, its value is the Rhai
-  entry script, and every file input stays available via the `files` map.
-- Otherwise the **first file input** is the entry script. It is *consumed*: it
-  does not appear in the `files` map, which holds only the remaining files.
+- A **`script` field**, whose value is the Rhai source inline.
+- A file declared under the **`script` key**, whose contents are the Rhai source.
 
-Either way the remaining files are read by the host and handed to the script via
-the `files` map. Directories declared in `dirs` are preopened read-only and
-reachable with the filesystem functions below.
+```yaml
+sync:
+  steps:
+    - plugin: ./icp_rhai_plugin.wasm
+      files:
+        script: sync.rhai
+        seed: [seed/users.json, seed/roles.json]
+      dirs:
+        assets: assets
+```
+
+Every declared file — the entry script included — is read by the host and handed
+to the script via the `files` map, keyed by path. Directories declared in `dirs`
+are preopened read-only and reachable with the filesystem functions below.
+Declaring `files:`/`dirs:` as a map instead of a plain list tags each entry with
+its key, which the script reads back through `file_keys` / `dir_keys`.
 
 A script runs to completion for a clean sync; throwing (or a runtime error)
 fails the step with the thrown message.
@@ -47,10 +58,21 @@ fails the step with the thrown message.
 | `identity_id`   | `String`                | Textual principal of the signing identity.              |
 | `identity`      | `Principal`             | The signing identity as a `Principal`.                  |
 | `proxy`         | `Principal` \| `()`     | Proxy canister if `--proxy` was set, else unit.         |
-| `dirs`          | `Array` of `String`     | Declared directories (preopened read-only).             |
-| `files`         | `Map` (name → `String`) | Declared files by name (minus a consumed entry script). |
+| `dirs`          | `Array` of `String`     | Declared directory paths (preopened read-only).         |
+| `dir_keys`      | `Map` (key → `Array`)   | Manifest key → the directory paths declared under it.   |
+| `files`         | `Map` (path → `String`) | Contents of every declared file, by path.               |
+| `file_keys`     | `Map` (key → `Array`)   | Manifest key → the file paths declared under it.        |
 | `fields`        | `Map` (name → `String`) | Key-value fields declared in the step's `fields`.       |
 | `canister_ids`  | `Map` (name → `String`) | Every project canister's name → textual principal.      |
+
+`dir_keys` and `file_keys` cover only the entries declared under a map key; a
+plain-list `dirs:`/`files:` has none, and appears only in `dirs`/`files`. One key
+may name several paths, so each maps to an array:
+
+```js
+// Contents of every file declared under the `seed` key.
+let seeds = file_keys.seed.map(|path| files[path]);
+```
 
 `canister_ids` is informational: it maps each named canister in the project
 (both `subproject:local` keys and bare local names for same-subproject siblings)
